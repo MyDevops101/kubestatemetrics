@@ -1,0 +1,28 @@
+# monitoring/prometheus-rules.yaml
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: kube-state-metrics-alerts
+  namespace: monitoring
+spec:
+  groups:
+  - name: kube-state-metrics
+    rules:
+    - alert: KubeStateMetricsDown
+      expr: up{job="kube-state-metrics"} == 0
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Kube-state-metrics is down"
+        description: "Kube-state-metrics has been down for more than 5 minutes."
+    
+    - alert: KubeStateMetricsHighMemory
+      expr: container_memory_usage_bytes{pod=~"kube-state-metrics.*"} > 500000000
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Kube-state-metrics high memory usage"
+        description: "Kube-state-metrics is using more than 500MB of memory."
