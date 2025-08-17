@@ -1,0 +1,20 @@
+# helm/kube-state-metrics/values-prod.yaml
+
+replicaCount: 3
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 200m
+    memory: 256Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2

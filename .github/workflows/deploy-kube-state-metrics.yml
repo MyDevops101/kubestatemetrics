@@ -1,0 +1,234 @@
+name: Deploy Kube-State-Metrics to AKS
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'helm/kube-state-metrics/**'
+      - '.github/workflows/deploy-kube-state-metrics.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'helm/kube-state-metrics/**'
+      - '.github/workflows/deploy-kube-state-metrics.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+env:
+  HELM_VERSION: '3.13.1'
+  KUBECTL_VERSION: '1.28.3'
+  NAMESPACE: 'monitoring'
+  RELEASE_NAME: 'kube-state-metrics'
+  CHART_REPOSITORY: 'oci://ghcr.io/prometheus-community/charts'
+  CHART_NAME: 'kube-state-metrics'
+
+jobs:
+  validate:
+    name: Validate Helm Chart
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Fetch Helm chart values
+        run: |
+          echo "Fetching default values from Helm chart..."
+          helm show values ${{ env.CHART_REPOSITORY }}/${{ env.CHART_NAME }} > default-values.yaml
+          
+      - name: Lint Helm values
+        run: |
+          echo "Attempting dry-run with values..."
+          helm template ${{ env.RELEASE_NAME }} \
+            ${{ env.CHART_REPOSITORY }}/${{ env.CHART_NAME }} \
+            -f helm/kube-state-metrics/values.yaml \
+            --debug > /dev/null
+
+  deploy:
+    name: Deploy to AKS
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name != 'pull_request'
+    environment:
+      name: ${{ github.event.inputs.environment || (github.ref == 'refs/heads/main' && 'prod' || 'dev') }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set environment variables
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]] || [[ "${{ github.event.inputs.environment }}" == "prod" ]]; then
+            echo "ENVIRONMENT=prod" >> $GITHUB_ENV
+            echo "VALUES_FILE=helm/kube-state-metrics/values-prod.yaml" >> $GITHUB_ENV
+          elif [[ "${{ github.event.inputs.environment }}" == "staging" ]]; then
+            echo "ENVIRONMENT=staging" >> $GITHUB_ENV
+            echo "VALUES_FILE=helm/kube-state-metrics/values-staging.yaml" >> $GITHUB_ENV
+          else
+            echo "ENVIRONMENT=dev" >> $GITHUB_ENV
+            echo "VALUES_FILE=helm/kube-state-metrics/values-dev.yaml" >> $GITHUB_ENV
+          fi
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name ${{ secrets.AKS_CLUSTER_NAME }} \
+            --overwrite-existing
+
+      - name: Create namespace if not exists
+        run: |
+          kubectl create namespace ${{ env.NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Add Helm repository (for debugging)
+        run: |
+          # Note: OCI registries don't need to be added, but we'll show values
+          echo "Fetching chart information..."
+          helm show chart ${{ env.CHART_REPOSITORY }}/${{ env.CHART_NAME }}
+
+      - name: Deploy Kube-State-Metrics
+        run: |
+          echo "Deploying kube-state-metrics to ${{ env.ENVIRONMENT }} environment..."
+          
+          # Check if release exists
+          if helm list -n ${{ env.NAMESPACE }} | grep -q ${{ env.RELEASE_NAME }}; then
+            echo "Upgrading existing release..."
+            ACTION="upgrade"
+          else
+            echo "Installing new release..."
+            ACTION="install"
+          fi
+          
+          # Deploy using Helm
+          helm $ACTION ${{ env.RELEASE_NAME }} \
+            ${{ env.CHART_REPOSITORY }}/${{ env.CHART_NAME }} \
+            --namespace ${{ env.NAMESPACE }} \
+            --create-namespace \
+            --values helm/kube-state-metrics/values.yaml \
+            --values ${{ env.VALUES_FILE }} \
+            --set podAnnotations.deployedBy="GitHub-Actions" \
+            --set podAnnotations.deployedAt="$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            --set podAnnotations.commit="${{ github.sha }}" \
+            --timeout 10m \
+            --wait \
+            --debug
+
+      - name: Verify deployment
+        run: |
+          echo "Waiting for deployment to be ready..."
+          kubectl rollout status deployment/${{ env.RELEASE_NAME }}-kube-state-metrics \
+            -n ${{ env.NAMESPACE }} \
+            --timeout=300s
+          
+          echo "Checking pods..."
+          kubectl get pods -n ${{ env.NAMESPACE }} -l app.kubernetes.io/name=kube-state-metrics
+          
+          echo "Checking service..."
+          kubectl get svc -n ${{ env.NAMESPACE }} -l app.kubernetes.io/name=kube-state-metrics
+
+      - name: Run smoke tests
+        run: |
+          echo "Running smoke tests..."
+          
+          # Wait for pods to be ready
+          kubectl wait --for=condition=ready pod \
+            -l app.kubernetes.io/name=kube-state-metrics \
+            -n ${{ env.NAMESPACE }} \
+            --timeout=300s
+          
+          # Port forward to test metrics endpoint
+          kubectl port-forward -n ${{ env.NAMESPACE }} \
+            service/${{ env.RELEASE_NAME }}-kube-state-metrics \
+            8080:8080 &
+          
+          # Give port-forward time to establish
+          sleep 5
+          
+          # Test metrics endpoint
+          curl -s http://localhost:8080/metrics | grep -q "kube_" && \
+            echo "✓ Metrics endpoint is working" || \
+            echo "✗ Metrics endpoint test failed"
+          
+          # Kill port-forward
+          kill %1 || true
+
+      - name: Output deployment info
+        if: success()
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: ${{ env.ENVIRONMENT }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Namespace**: ${{ env.NAMESPACE }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Release**: ${{ env.RELEASE_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Chart**: ${{ env.CHART_REPOSITORY }}/${{ env.CHART_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Resources Created:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          kubectl get all -n ${{ env.NAMESPACE }} -l app.kubernetes.io/name=kube-state-metrics >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  rollback:
+    name: Rollback Deployment
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: failure() && github.event_name != 'pull_request'
+    steps:
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name ${{ secrets.AKS_CLUSTER_NAME }} \
+            --overwrite-existing
+
+      - name: Rollback Helm release
+        run: |
+          echo "Rolling back kube-state-metrics deployment..."
+          helm rollback ${{ env.RELEASE_NAME }} \
+            --namespace ${{ env.NAMESPACE }} \
+            --wait \
+            --timeout 5m

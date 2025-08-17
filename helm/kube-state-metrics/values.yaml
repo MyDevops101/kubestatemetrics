@@ -1,0 +1,133 @@
+# helm/kube-state-metrics/values.yaml
+
+# Kube-State-Metrics Configuration
+replicaCount: 2  # High availability
+
+image:
+  repository: registry.k8s.io/kube-state-metrics/kube-state-metrics
+  tag: v2.10.1  # Specify version for consistency
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8080
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+
+# Resource limits and requests
+resources:
+  limits:
+    cpu: 200m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+# Horizontal Pod Autoscaler
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: 80
+
+# Pod Security Context
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  fsGroup: 65534
+
+# Security Context
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+    - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65534
+
+# Service Monitor for Prometheus Operator (if using)
+serviceMonitor:
+  enabled: true
+  interval: 30s
+  scrapeTimeout: 10s
+  labels:
+    release: prometheus
+  honorLabels: true
+
+# Pod Disruption Budget
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Node Selector (optional)
+nodeSelector: {}
+  # kubernetes.io/os: linux
+
+# Tolerations (optional)
+tolerations: []
+
+# Affinity rules for pod distribution
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+    - weight: 100
+      podAffinityTerm:
+        labelSelector:
+          matchExpressions:
+          - key: app.kubernetes.io/name
+            operator: In
+            values:
+            - kube-state-metrics
+        topologyKey: kubernetes.io/hostname
+
+# Metrics configuration
+collectors:
+  - certificatesigningrequests
+  - configmaps
+  - cronjobs
+  - daemonsets
+  - deployments
+  - endpoints
+  - horizontalpodautoscalers
+  - ingresses
+  - jobs
+  - leases
+  - limitranges
+  - mutatingwebhookconfigurations
+  - namespaces
+  - networkpolicies
+  - nodes
+  - persistentvolumeclaims
+  - persistentvolumes
+  - poddisruptionbudgets
+  - pods
+  - replicasets
+  - replicationcontrollers
+  - resourcequotas
+  - secrets
+  - services
+  - statefulsets
+  - storageclasses
+  - validatingwebhookconfigurations
+  - volumeattachments
+
+# Namespace to watch (empty means all namespaces)
+namespaces: ""
+
+# Enable kubeconfig
+kubeconfig:
+  enabled: false
+
+# RBAC configuration
+rbac:
+  create: true
+  useClusterRole: true
+
+# Service Account
+serviceAccount:
+  create: true
+  name: kube-state-metrics
+  annotations: {}
